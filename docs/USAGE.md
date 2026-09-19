@@ -89,7 +89,9 @@ for rows.Next() {
     if err := rows.Scan(&h); err != nil {
         return nil, err
     }
-    tree.AppendHash(h)   // 注意是 AppendHash，不是 Append
+    if _, err := tree.AppendHash(h); err != nil {   // 注意是 AppendHash，不是 Append
+        return nil, err
+    }
 }
 return tree, rows.Err()
 ```
@@ -98,9 +100,9 @@ return tree, rows.Err()
 
 - **`ORDER BY idx` 不能省。** SQLite 不保证返回顺序，顺序错了树根就错了，而且不会报错。
 - **下标必须连续无缺口。** 这是仅追加日志，中间删一条会让后面所有证明失效。别对 `leaves` 做 `DELETE`。
-- **喂 `AppendHash` 而不是 `Append`。** 传原始数据进 `AppendHash` 会把数据当成哈希用，树根静默错误。
+- **喂 `AppendHash` 而不是 `Append`。** `AppendHash` 会校验长度必须为 32 字节，所以传原始数据进去多半会直接报错；但如果数据恰好是 32 字节，它就会被当成叶子哈希用，树根静默错误。
 
-重建后建议比对一下树根与上次发布的是否一致，作为数据完整性自检。
+`AppendHash` 只能拦住长度不对的哈希，拦不住长度对但内容被改过的。**重建后务必比对树根与上次发布的值**，这才是真正的完整性自检。
 
 ## 5. 用 SM2 给树根签名
 
@@ -148,7 +150,7 @@ index := tree.Append(canonical)
 
 ## 7. 超出内存的日志
 
-`Tree` 把全部节点哈希留在内存里，约 `2N` 个 32 字节哈希（百万叶子约 64MB）。超过这个量级就别用 `Tree` 了，换成上游的 `compact.Range` 配合外部节点存储：
+`Tree` 把全部节点哈希留在内存里，约 `2N` 个哈希。每个哈希是独立的 `[]byte`，除 32 字节数据外还有 24 字节切片头，**实测百万叶子约 114MB**（约 114 字节/叶子，`runtime.MemStats` 实测值，不是理论估算）。超过这个量级就别用 `Tree` 了，换成上游的 `compact.Range` 配合外部节点存储：
 
 ```go
 import "github.com/transparency-dev/merkle/compact"
@@ -170,10 +172,12 @@ err := rng.Append(sm3merkle.DefaultHasher.HashLeaf(data), func(id compact.NodeID
 
 | 情形 | 行为 |
 | --- | --- |
+| `AppendHash(h)`，`len(h) != 32` | 返回错误，树不被修改 |
 | `LeafHash(index)`，`index >= Size()` | 返回错误 |
 | `RootAt(size)` / 各证明方法，`size > Size()` | 返回错误 |
 | `InclusionProof(index, size)`，`index >= size` | 返回上游错误 |
 | `ConsistencyProof(size1, size2)`，`size1 > size2` | 返回上游错误 |
+| `ConsistencyProof(0, size2)` | 合法，返回空证明（空树是任何树的前缀） |
 | 空树 `Root()` | 返回 `SM3()`，非 nil |
 
 `Root()` 是唯一会 panic 的方法，且只在内部状态损坏时触发（正常路径走不到）。其余越界一律返回错误。

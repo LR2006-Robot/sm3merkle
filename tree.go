@@ -1,6 +1,7 @@
 package sm3merkle
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/transparency-dev/merkle"
@@ -13,7 +14,8 @@ import (
 // 零值不可用，请用 New 或 NewWithHasher 构造。Tree 不是并发安全的，
 // 多 goroutine 访问需自行加锁。
 //
-// ponytail: 全部节点哈希常驻内存，约 2*N 个 32 字节哈希，百万叶子约 64MB。
+// ponytail: 全部节点哈希常驻内存，约 2*N 个哈希，每个连 []byte 切片头约 56 字节，
+// 实测百万叶子约 114MB。
 // 日志规模超出内存时，改用 compact.Range 配合外部节点存储（见 docs/USAGE.md
 // “超出内存的日志”一节），本包的 Hasher 可以原样复用。
 type Tree struct {
@@ -34,14 +36,31 @@ func NewWithHasher(h merkle.LogHasher) *Tree { return &Tree{hasher: h} }
 
 // Append 追加一条数据作为新叶子，返回它的下标。
 func (t *Tree) Append(data []byte) uint64 {
-	return t.AppendHash(t.hasher.HashLeaf(data))
+	// HashLeaf 的输出长度天然正确，无须走带校验的那条路径。
+	return t.appendHash(t.hasher.HashLeaf(data))
 }
 
 // AppendHash 追加一个已经算好的叶子哈希，返回它的下标。
 //
 // 用于从持久化存储重建整棵树：把库里存的叶子哈希按下标顺序喂进来即可，
-// 不需要原始数据。调用方需保证哈希是用同一个 hasher 的 HashLeaf 算出来的。
-func (t *Tree) AppendHash(leafHash []byte) uint64 {
+// 不需要原始数据。
+//
+// 哈希长度必须等于 hasher 的 Size()，否则返回错误且树不被修改。这个检查
+// 拦的是恢复路径上最坏的一类事故——存储里的字节被截断、或误把原始数据当
+// 哈希传入时，树会静默地长出一个错误的根，所有证明随之失效却没有任何报错。
+// 长度对但内容错仍然无法在这里发现，恢复后请比对树根与上次发布的值。
+//
+// leafHash 会被复制一份，调用方可以安全地复用传入的缓冲区。
+func (t *Tree) AppendHash(leafHash []byte) (uint64, error) {
+	if got, want := len(leafHash), t.hasher.Size(); got != want {
+		return 0, fmt.Errorf("sm3merkle: 叶子哈希长度为 %d 字节, 应为 %d", got, want)
+	}
+	// 必须拷贝：否则调用方复用缓冲区会静默改写已经入树的叶子哈希。
+	return t.appendHash(bytes.Clone(leafHash)), nil
+}
+
+// appendHash 是不做校验的内部追加，调用方须保证哈希长度正确。
+func (t *Tree) appendHash(leafHash []byte) uint64 {
 	index := t.size
 
 	// 每当 size 的第 level 位是 1，说明该层右侧已有一个待合并的兄弟节点。
@@ -65,7 +84,7 @@ func (t *Tree) AppendHash(leafHash []byte) uint64 {
 // Size 返回当前叶子数量。
 func (t *Tree) Size() uint64 { return t.size }
 
-// Root 返回当前树根。空树返回 EmptyRoot。
+// Root 返回当前树根。空树返回 EmptyRoot。返回的是副本，可安全修改。
 func (t *Tree) Root() []byte {
 	root, err := t.RootAt(t.size)
 	if err != nil {
@@ -75,6 +94,7 @@ func (t *Tree) Root() []byte {
 }
 
 // RootAt 返回树在历史大小 size 时的根哈希，要求 0 <= size <= Size()。
+// 返回的是副本，可安全修改。
 func (t *Tree) RootAt(size uint64) ([]byte, error) {
 	if size > t.size {
 		return nil, fmt.Errorf("sm3merkle: size %d 超出当前树大小 %d", size, t.size)
@@ -91,15 +111,17 @@ func (t *Tree) RootAt(size uint64) ([]byte, error) {
 	for i := len(hashes) - 2; i >= 0; i-- {
 		root = t.hasher.HashChildren(hashes[i], root)
 	}
-	return root, nil
+	// size 恰为 2 的幂时上面的循环不执行，root 直接指向内部节点，必须拷贝。
+	return bytes.Clone(root), nil
 }
 
 // LeafHash 返回下标 index 处的叶子哈希，要求 0 <= index < Size()。
+// 返回的是副本，可安全修改。
 func (t *Tree) LeafHash(index uint64) ([]byte, error) {
 	if index >= t.size {
 		return nil, fmt.Errorf("sm3merkle: 叶子下标 %d 超出树大小 %d", index, t.size)
 	}
-	return t.hashes[0][index], nil
+	return bytes.Clone(t.hashes[0][index]), nil
 }
 
 // InclusionProof 返回「下标 index 的叶子确实在大小为 size 的树里」的包含证明，
@@ -133,7 +155,15 @@ func (t *Tree) rehash(nodes proof.Nodes) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return nodes.Rehash(hashes, t.hasher.HashChildren)
+	pf, err := nodes.Rehash(hashes, t.hasher.HashChildren)
+	if err != nil {
+		return nil, err
+	}
+	// Rehash 对无需重算的节点会原样透传内部切片，同样要拷贝。
+	for i := range pf {
+		pf[i] = bytes.Clone(pf[i])
+	}
+	return pf, nil
 }
 
 // nodes 按节点地址取出哈希。上游算出的地址一定落在已有节点内，

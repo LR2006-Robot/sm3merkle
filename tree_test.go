@@ -189,7 +189,9 @@ func TestRebuildFromLeafHashes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rebuilt.AppendHash(lh)
+		if _, err := rebuilt.AppendHash(lh); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if rebuilt.Size() != orig.Size() {
@@ -216,6 +218,34 @@ func TestOutOfRange(t *testing.T) {
 	}
 	if _, err := tree.ConsistencyProof(1, 2); err == nil {
 		t.Error("ConsistencyProof 越界未报错")
+	}
+}
+
+// 长度不对的叶子哈希必须被拒绝，且树保持原样——恢复路径上这是最要命的一类错误。
+func TestAppendHashRejectsWrongLength(t *testing.T) {
+	tree := New()
+	tree.Append([]byte("ok"))
+	before := append([]byte{}, tree.Root()...)
+
+	for _, n := range []int{0, 7, 16, 31, 33, 64} {
+		if _, err := tree.AppendHash(make([]byte, n)); err == nil {
+			t.Errorf("AppendHash 接受了 %d 字节的哈希", n)
+		}
+	}
+	if tree.Size() != 1 {
+		t.Errorf("被拒绝的追加改变了树大小: %d", tree.Size())
+	}
+	if !bytes.Equal(tree.Root(), before) {
+		t.Error("被拒绝的追加改变了树根")
+	}
+
+	// 正确长度应当通过。
+	lh, err := tree.LeafHash(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tree.AppendHash(lh); err != nil {
+		t.Errorf("正确长度的哈希被拒绝: %v", err)
 	}
 }
 
@@ -265,5 +295,64 @@ func TestSM3GoldenRoots(t *testing.T) {
 		if got := hex.EncodeToString(tree.Root()); got != w {
 			t.Errorf("size=%d 根 = %s, want %s", i+1, got, w)
 		}
+	}
+}
+
+// 切片别名：树内部不得与调用方共享底层数组，任何一侧的改动都不能穿透到另一侧。
+// 这两类事故都是静默的——树根变错但不报任何错。
+func TestNoSliceAliasing(t *testing.T) {
+	// 入参方向：调用方复用缓冲区喂 AppendHash。
+	src := New()
+	src.Append([]byte("a"))
+	src.Append([]byte("b"))
+	h0, _ := src.LeafHash(0)
+	h1, _ := src.LeafHash(1)
+	want := src.Root()
+
+	dst := New()
+	buf := make([]byte, HashSize)
+	copy(buf, h0)
+	if _, err := dst.AppendHash(buf); err != nil {
+		t.Fatal(err)
+	}
+	copy(buf, h1) // 复用同一个缓冲区
+	if _, err := dst.AppendHash(buf); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dst.Root(), want) {
+		t.Errorf("复用缓冲区污染了树: %x, want %x", dst.Root(), want)
+	}
+
+	// 返回值方向：改动 Root / LeafHash / 证明的返回值。
+	// 4 片叶子构成完美树，此时 RootAt 的折叠循环不执行，最容易暴露透传。
+	tree := New()
+	for _, d := range []string{"a", "b", "c", "d"} {
+		tree.Append([]byte(d))
+	}
+	before := bytes.Clone(tree.Root())
+
+	tree.Root()[0] ^= 0xff
+	if !bytes.Equal(tree.Root(), before) {
+		t.Error("修改 Root() 返回值写穿到了树内部")
+	}
+
+	lh, err := tree.LeafHash(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lh[0] ^= 0xff
+	if !bytes.Equal(tree.Root(), before) {
+		t.Error("修改 LeafHash() 返回值写穿到了树内部")
+	}
+
+	pf, err := tree.InclusionProof(1, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range pf {
+		pf[i][0] ^= 0xff
+	}
+	if !bytes.Equal(tree.Root(), before) {
+		t.Error("修改 InclusionProof 返回值写穿到了树内部")
 	}
 }
