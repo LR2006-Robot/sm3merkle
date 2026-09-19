@@ -1,0 +1,9 @@
+sm3merkle
+Copyright 2026 LR2006-Robot
+
+本项目的 Merkle 证明生成与校验逻辑来自
+github.com/transparency-dev/merkle（Copyright Google LLC，Apache License 2.0），
+以依赖方式引用，未修改其源码。
+
+本项目在其之上提供 SM3（GB/T 32905-2016）哈希层与内存树实现。
+内存树的追加进位写法参考了上游 testonly 包的参考实现。
